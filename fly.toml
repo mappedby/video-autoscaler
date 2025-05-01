@@ -1,0 +1,38 @@
+app = "listingai-video-autoscaler"
+primary_region = "yyz"
+
+[deploy]
+  strategy = "immediate"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[processes]
+  autoscaler = "ruby /app/video_queue_autoscaler.rb"
+
+[env]
+  CHECK_INTERVAL = "5"
+  QUIET_PERIOD = "30"
+  MAX_INSTANCES = "1"
+  TARGET_QUEUE = "video"
+  PROCESS_GROUP = "video_worker" 
+  TARGET_APP_NAME = "listingai-backend"
+  DEBUG = "false"  # Enable verbose debugging
+
+# TCP-based health check for the health server in your script
+[checks]
+  [checks.alive]
+    grace_period = "30s"
+    interval = "15s"
+    timeout = "10s"
+    type = "tcp"
+    port = 8080
+
+[[vm]]
+  cpu_kind = "shared"
+  size = "shared-cpu-1x"
+  memory = "256mb"
+  processes = ["autoscaler"]
+  min_machines_running = 1
+  auto_stop_machines = false
+  auto_start_machines = true
