@@ -128,8 +128,13 @@ class VideoQueueAutoscaler
       elapsed = Time.now - @empty_queue_since
       
       if elapsed >= @quiet_period
-        @logger.info "Queue empty for #{elapsed.to_i}s, initiating scale down"
-        scale_down
+        current_count = get_current_instances
+        if current_count > 0
+          @logger.info "Queue empty for #{elapsed.to_i}s, initiating scale down"
+          scale_down
+        else
+          @logger.debug "Queue empty for #{elapsed.to_i}s but no workers to scale down"
+        end
       else
         @logger.debug "Queue empty for #{elapsed.to_i}s (waiting for #{@quiet_period}s)"
       end
@@ -174,41 +179,38 @@ class VideoQueueAutoscaler
   
   def scale_down
     current_count = get_current_instances
+    return if current_count == 0
     
-    if current_count > 0
-      @logger.info "Scaling down video workers from #{current_count}"
+    @logger.info "Scaling down video workers from #{current_count}"
+    
+    if current_count == 1
+      list_cmd = "fly machines list --app #{@app_name} --json"
+      @logger.debug "Running command: #{list_cmd}"
+      output = `#{list_cmd}`
       
-      if current_count == 1
-        list_cmd = "fly machines list --app #{@app_name} --json"
-        @logger.debug "Running command: #{list_cmd}"
-        output = `#{list_cmd}`
+      if $?.success?
+        machines = JSON.parse(output)
+        running_machines = machines.select do |m|
+          m['state'] == 'started' && 
+          m['config'] && 
+          m['config']['env'] && 
+          m['config']['env']['FLY_PROCESS_GROUP'] == @process_group
+        end
         
-        if $?.success?
-          machines = JSON.parse(output)
-          running_machines = machines.select do |m|
-            m['state'] == 'started' && 
-            m['config'] && 
-            m['config']['env'] && 
-            m['config']['env']['FLY_PROCESS_GROUP'] == @process_group
-          end
-          
-          running_machines.each do |machine|
-            stop_cmd = "fly machines stop #{machine['id']} --app #{@app_name}"
-            @logger.debug "Running command: #{stop_cmd}"
-            result = system(stop_cmd)
-            @logger.info "Stopped machine #{machine['id']}"
-          end
-        else
-          @logger.error "Failed to list machines: #{$?.exitstatus}"
+        running_machines.each do |machine|
+          stop_cmd = "fly machines stop #{machine['id']} --app #{@app_name}"
+          @logger.debug "Running command: #{stop_cmd}"
+          result = system(stop_cmd)
+          @logger.info "Stopped machine #{machine['id']}"
         end
       else
-        cmd = "fly scale count #{current_count - 1} --app #{@app_name} --process-group #{@process_group} --yes"
-        @logger.debug "Running command: #{cmd}"
-        result = system(cmd)
-        @logger.info "Scaled down to #{current_count - 1} workers"
+        @logger.error "Failed to list machines: #{$?.exitstatus}"
       end
     else
-      @logger.debug "No video workers to scale down"
+      cmd = "fly scale count #{current_count - 1} --app #{@app_name} --process-group #{@process_group} --yes"
+      @logger.debug "Running command: #{cmd}"
+      result = system(cmd)
+      @logger.info "Scaled down to #{current_count - 1} workers"
     end
   end
   
