@@ -74,10 +74,10 @@ class VideoQueueAutoscaler
   def video_queue_empty?
     redis = Redis.new(url: @redis_url)
     
-    # Check video queue size
-    queue_size = redis.llen("queue:#{@target_queue}")
-    @logger.debug "Queue #{@target_queue} size: #{queue_size}"
-    return false if queue_size > 0
+    # Check only immediate queue jobs (ready to process now)
+    immediate_jobs = redis.llen("queue:#{@target_queue}")
+    @logger.info "Queue #{@target_queue} has #{immediate_jobs} jobs ready for processing"
+    return false if immediate_jobs > 0
 
     # Check Sidekiq's busy workers
     processes = redis.smembers('processes')
@@ -177,6 +177,36 @@ class VideoQueueAutoscaler
     end
   end
   
+  def machine_has_active_video_work?(machine_id)
+    # Check for FFmpeg processes on the specific machine
+    check_cmd = "fly ssh console -s #{machine_id} -a #{@app_name} -C 'pgrep -f ffmpeg | wc -l' 2>/dev/null"
+    @logger.debug "Checking for active video work on machine #{machine_id}"
+    
+    begin
+      ffmpeg_count = `#{check_cmd}`.strip.to_i
+      if ffmpeg_count > 0
+        @logger.info "Machine #{machine_id} has #{ffmpeg_count} active FFmpeg processes"
+        return true
+      end
+      
+      # Also check Sidekiq busy status
+      sidekiq_check_cmd = "fly ssh console -s #{machine_id} -a #{@app_name} -C 'ps aux | grep sidekiq | grep -v grep | grep \"busy\"' 2>/dev/null"
+      sidekiq_output = `#{sidekiq_check_cmd}`.strip
+      
+      if sidekiq_output.include?('[') && sidekiq_output.match(/\[.*[1-9].*busy\]/)
+        @logger.info "Machine #{machine_id} has busy Sidekiq workers"
+        return true
+      end
+      
+      @logger.debug "Machine #{machine_id} has no active video work"
+      return false
+    rescue => e
+      @logger.error "Error checking video work on machine #{machine_id}: #{e.message}"
+      # If we can't check, err on the side of caution
+      return true
+    end
+  end
+
   def scale_down
     current_count = get_current_instances
     return if current_count == 0
@@ -198,6 +228,12 @@ class VideoQueueAutoscaler
         end
         
         running_machines.each do |machine|
+          # Check if machine has active video work before stopping
+          if machine_has_active_video_work?(machine['id'])
+            @logger.info "Skipping shutdown of machine #{machine['id']} - active video work detected"
+            next
+          end
+          
           stop_cmd = "fly machines stop #{machine['id']} --app #{@app_name}"
           @logger.debug "Running command: #{stop_cmd}"
           result = system(stop_cmd)
@@ -207,31 +243,62 @@ class VideoQueueAutoscaler
         @logger.error "Failed to list machines: #{$?.exitstatus}"
       end
     else
-      cmd = "fly scale count #{current_count - 1} --app #{@app_name} --process-group #{@process_group} --yes"
-      @logger.debug "Running command: #{cmd}"
-      result = system(cmd)
-      @logger.info "Scaled down to #{current_count - 1} workers"
+      # For multiple machines, we need to be more careful about which ones to scale down
+      list_cmd = "fly machines list --app #{@app_name} --json"
+      @logger.debug "Running command: #{list_cmd}"
+      output = `#{list_cmd}`
+      
+      if $?.success?
+        machines = JSON.parse(output)
+        running_machines = machines.select do |m|
+          m['state'] == 'started' && 
+          m['config'] && 
+          m['config']['env'] && 
+          m['config']['env']['FLY_PROCESS_GROUP'] == @process_group
+        end
+        
+        # Find machines without active work to scale down
+        idle_machines = running_machines.select do |machine|
+          !machine_has_active_video_work?(machine['id'])
+        end
+        
+        machines_to_stop = [idle_machines.count, current_count - 1].min
+        
+        if machines_to_stop > 0
+          idle_machines.first(machines_to_stop).each do |machine|
+            stop_cmd = "fly machines stop #{machine['id']} --app #{@app_name}"
+            @logger.debug "Running command: #{stop_cmd}"
+            result = system(stop_cmd)
+            @logger.info "Stopped idle machine #{machine['id']}"
+          end
+        else
+          @logger.info "No idle machines found to scale down - all have active video work"
+        end
+      else
+        @logger.error "Failed to list machines: #{$?.exitstatus}"
+      end
     end
   end
   
   def should_scale_up?
     redis = Redis.new(url: @redis_url)
     
-    # Get video queue size
-    queue_size = redis.llen("queue:#{@target_queue}")
+    # Get immediate queue size (jobs ready to process now)
+    immediate_jobs = redis.llen("queue:#{@target_queue}")
     current_count = get_current_instances
     
     # Scale up if there are jobs and no instances
-    if queue_size > 0 && current_count == 0
-      @logger.info "Queue has jobs (#{queue_size}) but no workers, should scale up"
+    if immediate_jobs > 0 && current_count == 0
+      @logger.info "Queue has #{immediate_jobs} jobs but no workers, should scale up"
       return true
       
     # Scale up if there are more than 5 jobs per worker and we're below max
-    elsif queue_size > current_count * 5 && current_count < @max_instances
-      @logger.info "Queue has #{queue_size} jobs (> 5 per worker), should scale up"
+    elsif immediate_jobs > current_count * 5 && current_count < @max_instances
+      @logger.info "Queue has #{immediate_jobs} jobs (> 5 per worker), should scale up"
       return true
     end
     
+    @logger.debug "No scale up needed. Jobs: #{immediate_jobs}, Workers: #{current_count}"
     false
   rescue StandardError => e
     @logger.error "Error checking if scale up needed: #{e.message}"
@@ -280,6 +347,27 @@ class VideoQueueAutoscaler
       result = system(cmd)
       @logger.info "Scale up complete"
     end
+  end
+
+  # These methods are still useful for debugging but don't affect scaling
+  def count_scheduled_jobs(redis)
+    now = Time.now.to_f
+    scheduled = redis.zcount("schedule", "-inf", "+inf") || 0
+    @logger.debug "Found #{scheduled} scheduled jobs"
+    scheduled
+  rescue StandardError => e
+    @logger.error "Error checking scheduled jobs: #{e.message}"
+    0
+  end
+
+  def count_retry_jobs(redis)
+    now = Time.now.to_f
+    retries = redis.zcount("retry", "-inf", "+inf") || 0
+    @logger.debug "Found #{retries} retry jobs"
+    retries
+  rescue StandardError => e
+    @logger.error "Error checking retry jobs: #{e.message}"
+    0
   end
 end
 

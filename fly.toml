@@ -17,7 +17,7 @@ primary_region = "yyz"
   TARGET_QUEUE = "video"
   PROCESS_GROUP = "video_worker" 
   TARGET_APP_NAME = "listingai-backend"
-  DEBUG = "false"  # Enable verbose debugging
+  DEBUG = "true"  # Enable verbose debugging
 
 # TCP-based health check for the health server in your script
 [checks]
